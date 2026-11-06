@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 const app = new Hono<{ Bindings: Env }>()
 
 type IdRow = { id: string }
+type NameRow = { id: string; name: string }
 type ShareRow = {
   id: string
   memberId: string
@@ -11,6 +12,30 @@ type ShareRow = {
   idempotencyKey: string | null
 }
 type BalanceRow = { memberId: string; name: string; outstandingCents: number }
+type BillShareRow = {
+  billId: string
+  title: string
+  totalCents: number
+  shareId: string
+  memberId: string
+  memberName: string
+  amountCents: number
+  paidAt: string | null
+}
+type ShareView = {
+  id: string
+  memberId: string
+  memberName: string
+  amountCents: number
+  paidAt: string | null
+}
+type BillView = {
+  id: string
+  homeId: string
+  title: string
+  totalCents: number
+  shares: ShareView[]
+}
 
 // Reads the request body as a JSON object. Returns null for anything else.
 async function readJsonObject(request: Request): Promise<Record<string, unknown> | null> {
@@ -44,6 +69,25 @@ app.post('/api/homes', async (c) => {
   return c.json({ id, name }, 201)
 })
 
+app.get('/api/homes/:homeId', async (c) => {
+  const homeId = c.req.param('homeId')
+
+  const home = await c.env.DB.prepare('SELECT id, name FROM homes WHERE id = ?')
+    .bind(homeId)
+    .first<NameRow>()
+  if (home === null) {
+    return c.json({ error: 'home not found' }, 404)
+  }
+
+  const { results: members } = await c.env.DB.prepare(
+    'SELECT id, name FROM members WHERE home_id = ? ORDER BY position',
+  )
+    .bind(homeId)
+    .all<NameRow>()
+
+  return c.json({ id: home.id, name: home.name, members }, 200)
+})
+
 app.post('/api/homes/:homeId/members', async (c) => {
   const homeId = c.req.param('homeId')
 
@@ -71,6 +115,55 @@ app.post('/api/homes/:homeId/members', async (c) => {
     .run()
 
   return c.json({ id, homeId, name }, 201)
+})
+
+app.get('/api/homes/:homeId/bills', async (c) => {
+  const homeId = c.req.param('homeId')
+
+  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?')
+    .bind(homeId)
+    .first<IdRow>()
+  if (home === null) {
+    return c.json({ error: 'home not found' }, 404)
+  }
+
+  // Newest bill first. Inside a bill, shares follow the order the members were added.
+  const { results } = await c.env.DB.prepare(
+    `SELECT b.id AS billId, b.title AS title, b.total_cents AS totalCents,
+            s.id AS shareId, s.member_id AS memberId, m.name AS memberName,
+            s.amount_cents AS amountCents, s.paid_at AS paidAt
+     FROM bills b
+     JOIN shares s ON s.bill_id = b.id
+     JOIN members m ON m.id = s.member_id
+     WHERE b.home_id = ?
+     ORDER BY b.rowid DESC, m.position`,
+  )
+    .bind(homeId)
+    .all<BillShareRow>()
+
+  const bills = new Map<string, BillView>()
+  for (const row of results) {
+    let bill = bills.get(row.billId)
+    if (bill === undefined) {
+      bill = {
+        id: row.billId,
+        homeId,
+        title: row.title,
+        totalCents: row.totalCents,
+        shares: [],
+      }
+      bills.set(row.billId, bill)
+    }
+    bill.shares.push({
+      id: row.shareId,
+      memberId: row.memberId,
+      memberName: row.memberName,
+      amountCents: row.amountCents,
+      paidAt: row.paidAt,
+    })
+  }
+
+  return c.json({ bills: [...bills.values()] }, 200)
 })
 
 app.post('/api/homes/:homeId/bills', async (c) => {
